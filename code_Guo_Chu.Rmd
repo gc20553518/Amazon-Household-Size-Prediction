@@ -1,0 +1,570 @@
+---
+title: "UCLA Stats 101C - Regression Project"
+subtitle: "Predicting Amazon Household Size from Purchase Histories"
+author: "Guo On Chu"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.align = "center", fig.width = 6, fig.height = 4)
+```
+
+# Introduction
+
+Amazon knows very little about a customer beyond what's collected at
+sign-up: name, email, phone, age, address. It has no idea how many people
+actually live in that household or share the account. That's a problem,
+because household size is useful for a lot of things - predicting spending
+power, figuring out what kinds of products to recommend, etc. This project
+uses the survey data as a stand-in for a third-party data provider: the
+survey links a household-size answer to a person's full Amazon order
+history, and the goal is to train a model on that link so it can predict
+household size for the 2,000 respondents whose label was withheld for the
+Kaggle leaderboard. The tricky part is that the test set only gives us
+`Q.demos.gender` and `Q.demos.state` - none of the other survey questions
+are available - so basically all of the useful signal has to come out of
+`amazon-purchases.csv` itself: how often someone orders, how much they
+spend, and what kind of things they buy (toys, baby items, pet food, etc.)
+all seemed like reasonable proxies for how many people are in the house.
+Submissions are scored with RMSE, as defined on the competition page.
+
+# Setup: Libraries and Random Seed
+
+```{r libraries}
+set.seed(101)
+
+library(data.table)   # the purchase log has ~1.85M rows, need something fast
+library(dplyr)
+library(ggplot2)
+library(glmnet)        # ridge / lasso
+library(randomForest)  # random forest + variable importance
+library(gbm)           # gradient boosting, ended up being the final model
+```
+
+# Data Loading
+
+```{r load-data}
+survey <- fread("survey_train_test.csv")
+amz    <- fread("amazon-purchases.csv")
+
+dim(survey)
+dim(amz)
+```
+
+`survey` has one row per respondent. `test == TRUE` marks the 2,000
+respondents that make up the Kaggle test set (their survey answers besides
+gender/state are blank), and `test == FALSE` marks the 3,027 respondents
+that have a labeled `Q.amazon.use.hh.size.num`. `amz` is the raw order
+history - one row per item purchased - for all 5,027 respondents, linked
+by `Survey ResponseID`.
+
+# Feature Engineering
+
+Since the test set doesn't give us much demographic info to work with, most
+of the effort here goes into building behavioral features out of the
+purchase log: how much someone orders and spends, how spread out their
+orders are over time, how many different categories they buy from, and
+what share of their orders fall into categories that seemed like they'd
+correlate with household size (toys, baby products, pet food, etc.).
+
+```{r feature-engineering}
+amz[, spend := `Purchase Price Per Unit` * Quantity]
+amz[, Category := ifelse(Category == "" | is.na(Category), "UNKNOWN", Category)]
+amz[, `Order Date` := as.Date(`Order Date`)]
+
+# use the 150 most common categories for the category-share features below
+top_cats <- amz[, .N, by = Category][order(-N)][1:150, Category]
+
+# one row per respondent, summarizing their order/spend/quantity behavior
+base_agg <- amz[, .(
+  n_orders        = .N,
+  total_spend     = sum(spend, na.rm = TRUE),
+  avg_price       = mean(`Purchase Price Per Unit`, na.rm = TRUE),
+  median_price    = median(`Purchase Price Per Unit`, na.rm = TRUE),
+  max_price       = max(`Purchase Price Per Unit`, na.rm = TRUE),
+  std_price       = sd(`Purchase Price Per Unit`, na.rm = TRUE),
+  total_qty       = sum(Quantity, na.rm = TRUE),
+  avg_qty         = mean(Quantity, na.rm = TRUE),
+  n_distinct_cat  = uniqueN(Category),
+  first_order     = min(`Order Date`, na.rm = TRUE),
+  last_order      = max(`Order Date`, na.rm = TRUE),
+  n_states        = uniqueN(`Shipping Address State`)
+), by = `Survey ResponseID`]
+
+setnames(base_agg, "Survey ResponseID", "Survey.ResponseID")
+base_agg[is.na(std_price), std_price := 0]   # happens when someone has exactly 1 order
+
+max_date <- max(amz$`Order Date`, na.rm = TRUE)
+base_agg[, span_days        := as.numeric(pmax(last_order - first_order, 1))]
+base_agg[, orders_per_month := n_orders / (span_days / 30 + 1)]
+base_agg[, spend_per_order  := total_spend / n_orders]
+base_agg[, qty_per_order    := total_qty / n_orders]
+base_agg[, cat_diversity    := n_distinct_cat / n_orders]
+base_agg[, recency_days     := as.numeric(max_date - last_order)]
+base_agg[, tenure_days      := as.numeric(max_date - first_order)]
+base_agg[, spend_per_day    := total_spend / pmax(tenure_days, 1)]
+base_agg[, orders_per_day   := n_orders / pmax(tenure_days, 1)]
+base_agg[, log_total_spend  := log1p(total_spend)]
+base_agg[, log_n_orders     := log1p(n_orders)]
+base_agg[, log_total_qty    := log1p(total_qty)]
+base_agg[, first_order := NULL]
+base_agg[, last_order  := NULL]
+
+# a few keyword-based category groups I picked out by hand, since these
+# seemed like the clearest household-composition proxies in the data
+baby_cats <- grep("BABY|INFANT|TODDLER", unique(amz$Category), value = TRUE)
+pet_cats  <- grep("PET",                 unique(amz$Category), value = TRUE)
+toy_cats  <- grep("TOY",                 unique(amz$Category), value = TRUE)
+kid_cats  <- grep("CHILDREN",            unique(amz$Category), value = TRUE)
+
+group_stats <- function(cats, prefix) {
+  sub <- amz[Category %in% cats]
+  g <- sub[, .(orders = .N, qty = sum(Quantity, na.rm = TRUE)), by = `Survey ResponseID`]
+  setnames(g, c("Survey.ResponseID", paste0(prefix, "_orders"), paste0(prefix, "_qty")))
+  g
+}
+baby_g <- group_stats(baby_cats, "baby")
+pet_g  <- group_stats(pet_cats,  "pet")
+toy_g  <- group_stats(toy_cats,  "toy")
+kid_g  <- group_stats(kid_cats,  "kidcostume")
+
+# for each respondent, what fraction of their orders fall in each top category
+amz_top <- amz[Category %in% top_cats]
+cat_counts <- dcast(amz_top, `Survey ResponseID` ~ Category,
+                     fun.aggregate = length, value.var = "Category")
+setnames(cat_counts, "Survey ResponseID", "Survey.ResponseID")
+cnt_cols <- setdiff(names(cat_counts), "Survey.ResponseID")
+row_totals <- rowSums(cat_counts[, ..cnt_cols])
+cat_props <- copy(cat_counts)
+for (cl in cnt_cols) cat_props[[cl]] <- cat_counts[[cl]] / row_totals
+setnames(cat_props, cnt_cols, paste0("prop_", cnt_cols))
+
+# glue it all together into one feature table, one row per respondent
+purchase_feats <- merge(base_agg, cat_props, by = "Survey.ResponseID", all.x = TRUE, sort = FALSE)
+purchase_feats <- merge(purchase_feats, baby_g, by = "Survey.ResponseID", all.x = TRUE, sort = FALSE)
+purchase_feats <- merge(purchase_feats, pet_g,  by = "Survey.ResponseID", all.x = TRUE, sort = FALSE)
+purchase_feats <- merge(purchase_feats, toy_g,  by = "Survey.ResponseID", all.x = TRUE, sort = FALSE)
+purchase_feats <- merge(purchase_feats, kid_g,  by = "Survey.ResponseID", all.x = TRUE, sort = FALSE)
+
+dim(purchase_feats)
+```
+
+Now I merge these onto the survey table. A handful of respondents (about 10
+out of 5,027) never made a single Amazon purchase, so they end up with `NA`
+for every purchase feature - I fill those with 0, since "zero orders in
+this category" is a real, meaningful value rather than something missing.
+
+```{r merge-and-fill}
+df <- merge(survey, purchase_feats, by = "Survey.ResponseID", all.x = TRUE, sort = FALSE)
+
+num_cols <- setdiff(names(purchase_feats), "Survey.ResponseID")
+for (c in num_cols) set(df, which(is.na(df[[c]])), c, 0)
+
+# gender is available for every respondent, so it's cheap to include
+# (state gets dropped later - see Preprocessing for why)
+df[, gender_male   := as.integer(Q.demos.gender == "Male")]
+df[, gender_female := as.integer(Q.demos.gender == "Female")]
+
+table(df$test)
+```
+
+# Exploratory Data Analysis
+
+```{r eda-target-dist, fig.cap="Distribution of the household-size response variable in the training set."}
+train_only <- df[test == FALSE]
+
+ggplot(train_only, aes(x = factor(Q.amazon.use.hh.size.num))) +
+  geom_bar(fill = "#4C72B0") +
+  labs(title = "Distribution of Household Size (Training Set)",
+       x = "Household size (4 = 4 or more)", y = "Number of respondents") +
+  theme_minimal()
+```
+
+The response is capped at 4 since the survey question tops out at "4+", so
+it's really a four-level ordinal variable rather than an open-ended count.
+Two-person households are the most common, with single-person and
+four-or-more households both fairly common too. I used this to justify
+clipping every model's predictions to `[1, 4]` later on, since going
+outside that range can only hurt the RMSE.
+
+```{r eda-orders, fig.cap="Number of Amazon orders by household size."}
+ggplot(train_only, aes(x = factor(Q.amazon.use.hh.size.num), y = n_orders)) +
+  geom_boxplot(fill = "#DD8452") +
+  coord_cartesian(ylim = c(0, quantile(train_only$n_orders, 0.95))) +
+  labs(title = "Number of Amazon Orders vs. Household Size",
+       x = "Household size", y = "Total number of orders") +
+  theme_minimal()
+```
+
+Bigger households order slightly more on average, but the boxes overlap a
+lot across all four groups. Order count by itself is a pretty weak signal -
+I noticed this early on and it's a big part of why I ended up building
+dozens of more specific features instead of leaning on a couple of obvious
+ones like total orders or total spend.
+
+```{r eda-spend, fig.cap="Log total spend by household size."}
+ggplot(train_only, aes(x = factor(Q.amazon.use.hh.size.num), y = log1p(total_spend))) +
+  geom_boxplot(fill = "#55A868") +
+  labs(title = "Log Total Spend vs. Household Size",
+       x = "Household size", y = "log(1 + total spend)") +
+  theme_minimal()
+```
+
+Total spend (log-scaled here since it's heavily skewed) tells basically the
+same story as order count, which isn't surprising given how correlated the
+two are with each other. Neither one does a great job separating the four
+groups on its own.
+
+```{r eda-toys, fig.cap="Share of orders in the toys-and-games category by household size."}
+ggplot(train_only, aes(x = factor(Q.amazon.use.hh.size.num), y = prop_TOYS_AND_GAMES)) +
+  geom_boxplot(fill = "#C44E52") +
+  labs(title = "Share of Orders in TOYS_AND_GAMES vs. Household Size",
+       x = "Household size", y = "Proportion of orders") +
+  theme_minimal()
+```
+
+This one's more interesting - the share of a respondent's orders that go
+toward toys and games climbs pretty steadily with household size, and it
+turned out to be the single most correlated numeric feature I found. Makes
+sense intuitively: bigger households are more likely to have kids in them,
+and toy purchases are a decent stand-in for that.
+
+```{r eda-baby, fig.cap="Household size composition by presence of baby-category purchases."}
+train_only[, has_baby_purchase := ifelse(is.na(baby_orders) | baby_orders == 0, "No", "Yes")]
+
+ggplot(train_only, aes(x = has_baby_purchase, fill = factor(Q.amazon.use.hh.size.num))) +
+  geom_bar(position = "fill") +
+  labs(title = "Household Size Composition by Presence of Baby-Category Purchases",
+       x = "Ever purchased a baby-related product", y = "Proportion of respondents",
+       fill = "Household size") +
+  theme_minimal()
+```
+
+Respondents who've ever bought something baby-related (car seats, formula,
+bottles, and so on) skew noticeably toward the 3-4 person households
+compared to everyone else. This is the kind of narrow, life-stage-specific
+signal that a broad feature like order count just can't pick up.
+
+```{r eda-pet, fig.cap="Share of orders in the pet-food category by household size."}
+ggplot(train_only, aes(x = factor(Q.amazon.use.hh.size.num), y = prop_PET_FOOD)) +
+  geom_boxplot(fill = "#8172B2") +
+  labs(title = "Share of Orders in PET_FOOD vs. Household Size",
+       x = "Household size", y = "Proportion of orders") +
+  theme_minimal()
+```
+
+Pet food share goes up a little with household size too, though it's a
+noisier relationship than toys or baby products. That tracks - having a pet
+correlates with having a bigger household, but plenty of small households
+have pets too, so I expected this feature to matter less in the final
+model.
+
+```{r eda-gender, fig.cap="Household size composition by gender."}
+ggplot(train_only, aes(x = Q.demos.gender, fill = factor(Q.amazon.use.hh.size.num))) +
+  geom_bar(position = "fill") +
+  labs(title = "Household Size Composition by Gender",
+       x = "Gender", y = "Proportion of respondents", fill = "Household size") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Gender is available for every single respondent, including the whole test
+set, but on its own it barely moves the household-size distribution. I kept
+it in anyway since it's free (no missing values to worry about), just not
+expecting it to do much heavy lifting.
+
+```{r eda-corr, fig.cap="Correlation of selected engineered features with household size.", fig.height=5}
+numeric_candidates <- c("n_orders", "total_spend", "total_qty", "n_distinct_cat",
+                         "orders_per_month", "span_days", "tenure_days",
+                         "prop_TOYS_AND_GAMES", "prop_TOY_FIGURE", "prop_PET_FOOD",
+                         "prop_HEADPHONES", "cat_diversity")
+
+corr_vals <- sapply(numeric_candidates, function(v) {
+  cor(train_only[[v]], train_only$Q.amazon.use.hh.size.num, use = "complete.obs")
+})
+corr_df <- data.frame(feature = names(corr_vals), correlation = as.numeric(corr_vals))
+corr_df <- corr_df[order(-abs(corr_df$correlation)), ]
+
+ggplot(corr_df, aes(x = reorder(feature, abs(correlation)), y = correlation)) +
+  geom_col(fill = "#4C72B0") +
+  coord_flip() +
+  labs(title = "Correlation of Selected Engineered Features with Household Size",
+       x = NULL, y = "Correlation with Q.amazon.use.hh.size.num") +
+  theme_minimal()
+```
+
+This lines up with the boxplots above - toy and family-category shares beat
+out the general activity features (`n_orders`, `total_spend`) in raw
+correlation. That said, every single correlation here is under 0.2 in
+absolute value, so I went into modeling knowing this was going to be a
+noisy, hard-to-predict target, which is really the whole reason I leaned
+toward flexible non-linear models instead of trusting a plain linear fit.
+
+# Preprocessing
+
+There are three preprocessing choices worth explaining here:
+
+1. **Missing purchase history.** As mentioned above, respondents with zero
+   Amazon purchases get 0 for every purchase feature instead of `NA` - see
+   the `merge-and-fill` chunk. Treating "no purchases" as missing data
+   didn't make sense to me since it's a real and informative outcome.
+2. **Dropping `Q.demos.state`.** State is available for every respondent,
+   so it's tempting to use it, but one-hot encoding it means adding about
+   50 mostly-empty indicator columns. When I tried this in cross-validation
+   it consistently made RMSE slightly worse - the extra columns seem to
+   just add noise without any real predictive payoff, so I left it out and
+   kept only gender as a demographic feature.
+3. **Feature selection.** After all the engineering above I ended up with
+   roughly 180 numeric features but only 3,027 labeled training rows, and
+   none of them are strongly predictive on their own (see the correlation
+   plot). That's a recipe for tree-based models overfitting to noise, so I
+   fit a quick random forest on the full training set just to rank features
+   by importance, then restricted every candidate model below to the top
+   45. This cut cross-validated RMSE noticeably compared to using all ~180
+   features.
+
+```{r feature-selection}
+meta_cols <- c("Survey.ResponseID", "Q.demos.age", "Q.demos.hispanic", "Q.demos.race",
+  "Q.demos.education", "Q.demos.income", "Q.demos.gender", "Q.sexual.orientation",
+  "Q.demos.state", "Q.amazon.use.howmany", "Q.amazon.use.hh.size",
+  "Q.amazon.use.hh.size.num", "Q.amazon.use.how.oft", "Q.substance.use.cigarettes",
+  "Q.substance.use.marijuana", "Q.substance.use.alcohol", "Q.personal.diabetes",
+  "Q.personal.wheelchair", "Q.life.changes", "Q.sell.YOUR.data", "Q.sell.consumer.data",
+  "Q.small.biz.use", "Q.census.use", "Q.research.society", "test")
+
+feature_cols <- setdiff(names(df), meta_cols)
+length(feature_cols)
+
+train <- df[test == FALSE]
+test_df  <- df[test == TRUE]
+
+X <- as.matrix(train[, ..feature_cols])
+y <- train$Q.amazon.use.hh.size.num
+
+set.seed(101)
+rf_screen <- randomForest(x = X, y = y, ntree = 300,
+                           mtry = floor(sqrt(ncol(X))), nodesize = 15)
+importance_ranked <- sort(importance(rf_screen)[, 1], decreasing = TRUE)
+top_feats <- names(importance_ranked)[1:45]
+
+X_sel      <- X[, top_feats]
+X_test_sel <- as.matrix(test_df[, ..top_feats])
+
+head(importance_ranked, 15)
+```
+
+# Candidate Models
+
+I tried five candidate models, all using the same 45 selected features,
+evaluated with 5-fold cross-validation on the training set. RMSE is
+computed on each held-out fold and predictions are clipped to `[1, 4]`
+before scoring, since the response never falls outside that range anyway.
+
+| Model identifier | Type                      | Variables        | Hyperparameters |
+|-------------------|---------------------------|-------------------|------------------|
+| M1_ridge          | Ridge regression (glmnet) | top 45 features   | alpha = 0, lambda chosen by internal CV |
+| M2_lasso          | Lasso regression (glmnet) | top 45 features   | alpha = 1, lambda chosen by internal CV |
+| M3_rf             | Random forest             | top 45 features   | ntree = 500, mtry = p/3, nodesize = 10 |
+| M4_gbm_shallow    | Gradient boosted trees    | top 45 features   | n.trees = 250, depth = 2, shrinkage = 0.02 |
+| M5_gbm_tuned      | Gradient boosted trees    | top 45 features   | n.trees = 300, depth = 3, shrinkage = 0.02, bag.fraction = 0.6 |
+
+```{r cv-setup}
+rmse <- function(pred, actual) sqrt(mean((pred - actual)^2))
+
+set.seed(42)
+k <- 5
+folds <- sample(rep(1:k, length.out = nrow(X_sel)))
+```
+
+```{r cv-ridge}
+ridge_scores <- c()
+for (i in 1:k) {
+  tr <- which(folds != i); va <- which(folds == i)
+  m <- cv.glmnet(X_sel[tr, ], y[tr], alpha = 0)
+  p <- pmin(pmax(as.numeric(predict(m, X_sel[va, ], s = "lambda.min")), 1), 4)
+  ridge_scores <- c(ridge_scores, rmse(p, y[va]))
+}
+```
+
+```{r cv-lasso}
+lasso_scores <- c()
+for (i in 1:k) {
+  tr <- which(folds != i); va <- which(folds == i)
+  m <- cv.glmnet(X_sel[tr, ], y[tr], alpha = 1)
+  p <- pmin(pmax(as.numeric(predict(m, X_sel[va, ], s = "lambda.min")), 1), 4)
+  lasso_scores <- c(lasso_scores, rmse(p, y[va]))
+}
+```
+
+```{r cv-rf}
+rf_scores <- c()
+for (i in 1:k) {
+  tr <- which(folds != i); va <- which(folds == i)
+  m <- randomForest(x = X_sel[tr, ], y = y[tr], ntree = 500,
+                     mtry = floor(ncol(X_sel) / 3), nodesize = 10)
+  p <- pmin(pmax(predict(m, X_sel[va, ]), 1), 4)
+  rf_scores <- c(rf_scores, rmse(p, y[va]))
+}
+```
+
+```{r cv-gbm-shallow}
+gbm_shallow_scores <- c()
+for (i in 1:k) {
+  tr <- which(folds != i); va <- which(folds == i)
+  m <- gbm.fit(x = as.data.frame(X_sel[tr, ]), y = y[tr], distribution = "gaussian",
+               n.trees = 250, interaction.depth = 2, shrinkage = 0.02,
+               bag.fraction = 0.7, verbose = FALSE)
+  p <- pmin(pmax(predict(m, as.data.frame(X_sel[va, ]), n.trees = 250), 1), 4)
+  gbm_shallow_scores <- c(gbm_shallow_scores, rmse(p, y[va]))
+}
+```
+
+```{r cv-gbm-tuned}
+gbm_tuned_scores <- c()
+for (i in 1:k) {
+  tr <- which(folds != i); va <- which(folds == i)
+  m <- gbm.fit(x = as.data.frame(X_sel[tr, ]), y = y[tr], distribution = "gaussian",
+               n.trees = 300, interaction.depth = 3, shrinkage = 0.02,
+               bag.fraction = 0.6, verbose = FALSE)
+  p <- pmin(pmax(predict(m, as.data.frame(X_sel[va, ]), n.trees = 300), 1), 4)
+  gbm_tuned_scores <- c(gbm_tuned_scores, rmse(p, y[va]))
+}
+```
+
+# Model Evaluation and Tuning
+
+```{r cv-results-table}
+results_tbl <- data.frame(
+  Model_identifier = c("M1_ridge", "M2_lasso", "M3_rf", "M4_gbm_shallow", "M5_gbm_tuned"),
+  Mean_CV_RMSE = c(mean(ridge_scores), mean(lasso_scores), mean(rf_scores),
+                    mean(gbm_shallow_scores), mean(gbm_tuned_scores))
+)
+results_tbl <- results_tbl[order(results_tbl$Mean_CV_RMSE), ]
+knitr::kable(results_tbl, digits = 4, caption = "5-fold CV RMSE by candidate model")
+```
+
+```{r cv-results-plot, fig.cap="Cross-validated RMSE comparison across candidate models."}
+ggplot(results_tbl, aes(x = reorder(Model_identifier, Mean_CV_RMSE), y = Mean_CV_RMSE)) +
+  geom_col(fill = "#4C72B0") +
+  coord_cartesian(ylim = c(min(results_tbl$Mean_CV_RMSE) * 0.97, max(results_tbl$Mean_CV_RMSE) * 1.01)) +
+  labs(title = "Cross-Validated RMSE by Candidate Model",
+       x = NULL, y = "Mean 5-fold CV RMSE") +
+  coord_flip() +
+  theme_minimal()
+```
+
+The two linear models (ridge, lasso) both trail the tree-based ones, which
+tells me the relationship here isn't linear - something like "lots of
+orders AND a high toy share" seems to matter more than either variable on
+its own. `M5_gbm_tuned` comes out on top, with the shallow GBM and random
+forest close behind. I went with the tuned GBM as my final model since the
+gap held up consistently across folds rather than being driven by one or
+two lucky splits.
+
+# Final Model and Interpretation
+
+I refit `M5_gbm_tuned` on the full training set (all 3,027 labeled
+respondents, not just the CV folds) using the same hyperparameters found
+above - more training data should only help, and there's no reason to
+hold any of it back once the model is chosen.
+
+```{r final-model}
+set.seed(101)
+final_model <- gbm.fit(x = as.data.frame(X_sel), y = y, distribution = "gaussian",
+                        n.trees = 300, interaction.depth = 3, shrinkage = 0.02,
+                        bag.fraction = 0.6, verbose = FALSE)
+```
+
+```{r final-importance, fig.cap="Top 15 feature importances for the final gradient boosting model.", fig.height=5}
+imp_df <- summary(final_model, n.trees = 300, plotit = FALSE)
+imp_df <- imp_df[1:15, ]
+
+ggplot(imp_df, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "#DD8452") +
+  coord_flip() +
+  labs(title = "Top 15 Feature Importances - Final GBM Model",
+       x = NULL, y = "Relative influence (%)") +
+  theme_minimal()
+```
+
+Toy- and baby-related purchase shares dominate the top of the importance
+list, along with a few general engagement measures like `tenure_days`,
+`span_days`, and `n_states`. That lines up with what I saw during EDA -
+household-composition proxies carry more weight than raw order volume. My
+guess for why tenure/span show up so high is that a longer purchase history
+just gives the model a more reliable read on someone's typical behavior,
+compared to a respondent with only a handful of orders on record.
+
+```{r individual-predictions}
+set.seed(7)
+example_idx <- sample(1:nrow(train), 3)
+example_feats <- c(imp_df$var[1:5])
+
+examples <- train[example_idx, c("Survey.ResponseID", "Q.amazon.use.hh.size.num",
+                                   example_feats), with = FALSE]
+examples$predicted <- pmin(pmax(predict(final_model,
+                          as.data.frame(X_sel[example_idx, ]), n.trees = 300), 1), 4)
+
+knitr::kable(examples, digits = 2,
+             caption = "Three example training respondents: top-5 feature values, actual, and predicted household size")
+```
+
+For these three respondents, the predictions move the way I'd expect given
+their feature values - higher toy/family-category shares and longer
+purchase tenure push the prediction toward a bigger household, while
+respondents with little activity in those categories get pulled toward a
+one- or two-person prediction. It's a small sample, but it's reassuring
+that the model is behaving the way the importance ranking says it should,
+rather than doing something I can't explain.
+
+# Discussion of Final Model
+
+**Model selection.** I went with `M5_gbm_tuned` - a gradient boosted tree
+model on the top 45 features - because it had the lowest 5-fold CV RMSE of
+the five candidates, and it beat the shallow GBM and random forest
+consistently across folds rather than just on average.
+
+**Strengths.** The model can pick up non-linear, interaction-heavy patterns
+between purchase categories and household size that a linear model would
+miss entirely, and it handles respondents with no purchase history
+gracefully (their features are just 0, and the model has learned to treat
+that as "low activity" rather than something broken).
+
+**Weaknesses.** Honestly, the signal in this problem is just weak. Even the
+best single feature I found correlates with household size at well under
+0.2, so the model's CV RMSE of about 1.03 is only a modest improvement over
+just predicting the training mean everywhere (which would land around
+1.06-1.10, given the response's standard deviation of roughly 1.1).
+Household size ultimately depends on things - family structure, life
+stage, income - that purchase history can only partly stand in for.
+
+**Possible improvements.** A few things that could plausibly help: ZIP-code
+level shipping addresses (to bring in Census household-size statistics for
+that area), order timestamps at the hour/day-of-week level (which might
+expose shared-account usage patterns), and product-level metadata like
+pack size or "family size" labeling that my category-share features only
+partially capture.
+
+# Generate Kaggle Submission
+
+```{r generate-submission}
+test_predictions <- pmin(pmax(predict(final_model, as.data.frame(X_test_sel), n.trees = 300), 1), 4)
+
+submission <- data.frame(
+  Survey.ResponseID = test_df$Survey.ResponseID,
+  Q.amazon.use.hh.size.num = test_predictions
+)
+
+fwrite(submission, "submission.csv")
+```
+
+# Appendix: Contributions
+
+This project was completed individually by Guo On Chu - all data loading,
+feature engineering, EDA, model implementation, cross-validation, tuning,
+and Kaggle submissions were done solely by me.
